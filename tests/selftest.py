@@ -4,6 +4,13 @@
 Spins up real master and slave processes (uvicorn) on loopback and drives
 them over HTTP and DNS/UDP. Exits non-zero if any check fails.
 
+Covers the per-source-network view feature: publishing override lists,
+longest-prefix match across overlapping networks, public fallback for
+uncovered names and unmatched networks, revocation falling back to the
+public address only, views versioned together with the zone, legacy
+(pre-views) snapshot compatibility, and view persistence across failed
+publishes, master outages and slave restarts.
+
 Run:  python tests/selftest.py
 Env:  PYBIN (python with fastapi/uvicorn/httpx installed, default sys.executable)
       MASTER_PORT (18080) SLAVE_PORT (18081) SLAVE_DNS_PORT (15353)
@@ -261,6 +268,7 @@ def main() -> int:
         print("\n== 6. concurrent publish/sync interleaving ==")
         stop = threading.Event()
         serials_seen = []
+        soa_serials_seen = []
         sync_errors = []
 
         def publisher():
@@ -268,6 +276,12 @@ def main() -> int:
                 st, b = http("PUT", f"{MASTER}/records/storm{i}.lab.test", {"ip": f"10.1.0.{i}"})
                 if st != 200:
                     sync_errors.append(f"publish {i}: {st} {b}")
+                # View rules are published through the same versioning
+                # machinery: interleave view overrides with record publishes.
+                st, b = http("PUT", f"{MASTER}/views/127.0.0.0/8/records/stormview{i}.lab.test",
+                             {"ip": f"10.2.0.{i}"})
+                if st != 200:
+                    sync_errors.append(f"view publish {i}: {st} {b}")
                 time.sleep(0.02)
 
         def syncer():
@@ -280,7 +294,21 @@ def main() -> int:
                     serials_seen.append(b2["serial"])
                 time.sleep(0.01)
 
-        threads = [threading.Thread(target=publisher)] + [threading.Thread(target=syncer) for _ in range(3)]
+        def dns_poller():
+            # Every SOA answer carries the serial of the version it was built
+            # from; observed over time it must never go backwards.
+            while not stop.is_set():
+                try:
+                    r = dns_query("lab.test", dnsproto.QTYPE_SOA, SLAVE_DNS_PORT, timeout=2)
+                    if r["answers"]:
+                        soa_serials_seen.append(r["answers"][0]["value"]["serial"])
+                except Exception as e:
+                    sync_errors.append(f"dns poll: {e}")
+                time.sleep(0.02)
+
+        threads = ([threading.Thread(target=publisher)]
+                   + [threading.Thread(target=syncer) for _ in range(3)]
+                   + [threading.Thread(target=dns_poller)])
         for t in threads:
             t.start()
         threads[0].join()
@@ -292,6 +320,10 @@ def main() -> int:
         check("served serial monotonically non-decreasing during storm",
               all(a <= b for a, b in zip(serials_seen, serials_seen[1:])),
               f"serials: {serials_seen[:20]}...")
+        check("SOA serial over DNS monotonically non-decreasing during storm",
+              len(soa_serials_seen) > 0
+              and all(a <= b for a, b in zip(soa_serials_seen, soa_serials_seen[1:])),
+              f"serials: {soa_serials_seen[:20]}...")
         st, mser = http("GET", f"{MASTER}/zone/serial")
         st, body = http("POST", f"{SLAVE}/sync", {})
         check("final sync converges to master serial", st == 200 and body.get("serial") == mser.get("serial"), f"got {st} {body}, master {mser}")
@@ -299,12 +331,22 @@ def main() -> int:
         st, szone = http("GET", f"{SLAVE}/zone")
         master_recs = {(r["name"], r["ip"], r["ttl"]) for r in snap.get("records", [])}
         slave_recs = {(r["name"], r["ip"], r["ttl"]) for r in szone.get("records", [])}
+        master_views = {(v["cidr"], r["name"], r["ip"], r["ttl"])
+                        for v in snap.get("views", []) for r in v["records"]}
+        slave_views = {(v["cidr"], r["name"], r["ip"], r["ttl"])
+                       for v in szone.get("views", []) for r in v["records"]}
         check("slave zone content exactly matches master snapshot at same serial (no mixed state)",
               snap.get("serial") == szone.get("serial") and master_recs == slave_recs,
               f"master serial {snap.get('serial')} slave serial {szone.get('serial')} "
               f"only-master={sorted(master_recs - slave_recs)[:3]} only-slave={sorted(slave_recs - master_recs)[:3]}")
+        check("slave view rules exactly match master snapshot at same serial",
+              master_views == slave_views,
+              f"only-master={sorted(master_views - slave_views)[:3]} only-slave={sorted(slave_views - master_views)[:3]}")
         r = dns_query("storm14.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
         check("storm record answered correctly", any(a["value"] == "10.1.0.14" for a in r["answers"]), json.dumps(r))
+        r = dns_query("stormview14.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
+        check("storm view override answered (view-only name, 127/8 view)",
+              any(a["value"] == "10.2.0.14" for a in r["answers"]), json.dumps(r))
 
         # ---- 7. master outage: slave keeps serving last version -------------
         print("\n== 7. master outage ==")
@@ -351,7 +393,9 @@ def main() -> int:
         print("\n== 10. /docs usable; recovery when master returns ==")
         master.start()
         assert wait_http(f"{MASTER}/zone/serial", master), "master did not restart"
-        for base, paths in ((MASTER, ("/records", "/records/bulk", "/zone/serial", "/zone/snapshot")),
+        for base, paths in ((MASTER, ("/records", "/records/bulk", "/views",
+                                      "/views/{cidr}", "/views/{cidr}/records/{name}",
+                                      "/zone/serial", "/zone/snapshot")),
                             (SLAVE, ("/sync", "/status"))):
             st, _ = http("GET", f"{base}/docs")
             check(f"/docs reachable on {base}", st == 200)
@@ -364,6 +408,183 @@ def main() -> int:
         check("sync recovers after master returns", st == 200 and body.get("serial") == new_serial, f"got {st} {body}")
         r = dns_query("back.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
         check("new record served after recovery", any(a["value"] == "10.7.7.7" for a in r["answers"]), json.dumps(r))
+
+        # ---- 11. views: publish, longest-prefix match, public fallback ------
+        print("\n== 11. views: publish, longest-prefix match, public fallback ==")
+        # All DNS queries in this test are sent from 127.0.0.1.
+        st, body = http("PUT", f"{MASTER}/views/127.0.0.9/8", {"records": [
+            {"name": "back.lab.test", "ip": "192.168.8.8"},
+            {"name": "viewonly.lab.test", "ip": "192.168.8.9", "ttl": 61},
+        ]})
+        check("view replace accepted; cidr normalized (host bits dropped)",
+              st == 200 and body.get("view") == "127.0.0.0/8", f"got {st} {body}")
+        st, body = http("PUT", f"{MASTER}/views/10.255.0.0/16", {"records": [
+            {"name": "back.lab.test", "ip": "203.0.113.66"},
+        ]})
+        check("view for a never-matching network accepted", st == 200, f"got {st} {body}")
+        st, mser2 = http("GET", f"{MASTER}/zone/serial")
+        st, body = http("POST", f"{SLAVE}/sync", {})
+        check("sync with views applied",
+              st == 200 and body.get("applied") is True and body.get("serial") == mser2.get("serial"),
+              f"got {st} {body}")
+        r = dns_query("back.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
+        check("single matching view (/8) answers",
+              any(a["value"] == "192.168.8.8" for a in r["answers"]), json.dumps(r))
+        check("unmatched network's address never leaks",
+              all(a["value"] != "203.0.113.66" for a in r["answers"]), json.dumps(r))
+        r = dns_query("viewonly.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
+        check("view-only name resolves for matching client (ttl=61)",
+              any(a["value"] == "192.168.8.9" and a["ttl"] == 61 for a in r["answers"]),
+              json.dumps(r))
+        r = dns_query("host1.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
+        check("name not overridden in selected view -> public record",
+              any(a["value"] == "10.9.9.1" for a in r["answers"]), json.dumps(r))
+        # Add a longer, overlapping network: it must take over.
+        st, body = http("PUT", f"{MASTER}/views/127.0.0.0/16/records/back.lab.test",
+                        {"ip": "192.168.16.16"})
+        check("single view override upsert accepted",
+              st == 200 and body.get("view") == "127.0.0.0/16", f"got {st} {body}")
+        st, mviews = http("GET", f"{MASTER}/views")
+        st, mser2 = http("GET", f"{MASTER}/zone/serial")
+        check("views listed at current serial",
+              mviews.get("serial") == mser2.get("serial")
+              and {v["cidr"] for v in mviews.get("views", [])}
+              == {"127.0.0.0/8", "127.0.0.0/16", "10.255.0.0/16"},
+              json.dumps(mviews))
+        vserial = mser2.get("serial")
+        st, body = http("POST", f"{SLAVE}/sync", {})
+        check("sync with overlapping views applied",
+              st == 200 and body.get("applied") is True and body.get("serial") == vserial,
+              f"got {st} {body}")
+        r = dns_query("back.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
+        check("overlapping networks: longest prefix (/16) wins",
+              any(a["value"] == "192.168.16.16" for a in r["answers"]), json.dumps(r))
+        r = dns_query("viewonly.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
+        check("name not covered by the selected (/16) view -> public (NXDOMAIN here)",
+              r["rcode"] == dnsproto.RCODE_NXDOMAIN, json.dumps(r))
+        rs = dns_query("lab.test", dnsproto.QTYPE_SOA, SLAVE_DNS_PORT)
+        check("SOA serial == view version (rules and records same version)",
+              rs["answers"] and rs["answers"][0]["value"]["serial"] == vserial, json.dumps(rs))
+        r = dns_query("nosuch11.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
+        check("NXDOMAIN unchanged; authority SOA serial == view version",
+              r["rcode"] == dnsproto.RCODE_NXDOMAIN and r["authority"]
+              and r["authority"][0]["value"]["serial"] == vserial, json.dumps(r))
+        st, szone = http("GET", f"{SLAVE}/zone")
+        check("slave /zone exposes views at the same serial",
+              st == 200 and szone.get("serial") == vserial
+              and {v["cidr"] for v in szone.get("views", [])}
+              == {"127.0.0.0/8", "127.0.0.0/16", "10.255.0.0/16"},
+              json.dumps(szone)[:300])
+
+        # ---- 12. revoking an override falls back to public only -------------
+        print("\n== 12. revoke override -> public address, never another view ==")
+        st, body = http("DELETE", f"{MASTER}/views/127.0.0.0/16/records/back.lab.test")
+        check("delete /16 override accepted", st == 200, f"got {st} {body}")
+        st, body = http("POST", f"{SLAVE}/sync", {})
+        check("sync applied", st == 200 and body.get("applied") is True, f"got {st} {body}")
+        r = dns_query("back.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
+        check("/16 gone -> /8 view answers now (still not the other site's)",
+              any(a["value"] == "192.168.8.8" for a in r["answers"])
+              and all(a["value"] != "203.0.113.66" for a in r["answers"]), json.dumps(r))
+        r = dns_query("viewonly.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
+        check("empty /16 view gone -> /8 view-only name resolves again",
+              any(a["value"] == "192.168.8.9" for a in r["answers"]), json.dumps(r))
+        st, body = http("DELETE", f"{MASTER}/views/127.0.0.0/8/records/back.lab.test")
+        check("delete /8 override accepted", st == 200, f"got {st} {body}")
+        st, body = http("POST", f"{SLAVE}/sync", {})
+        check("sync applied", st == 200 and body.get("applied") is True, f"got {st} {body}")
+        r = dns_query("back.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
+        check("override revoked -> public address, never another view's",
+              r["answers"] and all(a["value"] == "10.7.7.7" for a in r["answers"]),
+              json.dumps(r))
+        st, body = http("DELETE", f"{MASTER}/views/10.255.0.0/16")
+        check("delete whole view accepted", st == 200, f"got {st} {body}")
+        st, body = http("DELETE", f"{MASTER}/views/10.255.0.0/16")
+        check("re-delete view -> 404", st == 404, f"got {st} {body}")
+        st, body = http("POST", f"{SLAVE}/sync", {})
+        r = dns_query("back.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
+        check("still public after view deletion + sync",
+              st == 200 and r["answers"]
+              and all(a["value"] == "10.7.7.7" for a in r["answers"]),
+              f"{st} {body} {r}")
+
+        # ---- 13. legacy (pre-views) snapshot still syncs --------------------
+        print("\n== 13. legacy v1 snapshot still syncs; views cleared ==")
+        st, body = http("PUT", f"{MASTER}/records/legacytest.lab.test", {"ip": "10.5.5.5"})
+        legacy_serial = body.get("serial")
+        check("publish bumps serial", st == 200 and isinstance(legacy_serial, int),
+              f"got {st} {body}")
+        st, body = http("POST", f"{SLAVE}/sync", {"url": f"{MASTER}/debug/snapshot/legacy"})
+        check("legacy-format snapshot applied",
+              st == 200 and body.get("applied") is True and body.get("serial") == legacy_serial,
+              f"got {st} {body}")
+        r = dns_query("legacytest.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
+        check("record from legacy snapshot served",
+              any(a["value"] == "10.5.5.5" for a in r["answers"]), json.dumps(r))
+        r = dns_query("viewonly.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
+        check("legacy snapshot has no views -> view-only name now NXDOMAIN",
+              r["rcode"] == dnsproto.RCODE_NXDOMAIN, json.dumps(r))
+        st, body = http("GET", f"{SLAVE}/status")
+        check("status reports 0 views under legacy snapshot",
+              st == 200 and body.get("views") == 0, json.dumps(body))
+        st, mviews = http("GET", f"{MASTER}/views")
+        check("master still holds the view rules (legacy was only a rendering)",
+              any(v["cidr"] == "127.0.0.0/8" for v in mviews.get("views", [])),
+              json.dumps(mviews))
+        st, body = http("PUT", f"{MASTER}/views/127.0.0.0/8/records/viewonly.lab.test",
+                        {"ip": "192.168.8.9", "ttl": 61})
+        st, body = http("POST", f"{SLAVE}/sync", {})
+        check("normal sync re-applies views",
+              st == 200 and body.get("applied") is True, f"got {st} {body}")
+        r = dns_query("viewonly.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
+        check("view answer restored", any(a["value"] == "192.168.8.9" for a in r["answers"]),
+              json.dumps(r))
+
+        # ---- 14. failed publishes change nothing; views survive outage ------
+        print("\n== 14. failed publishes rejected; views survive outage+restart ==")
+        st, before = http("GET", f"{MASTER}/zone/serial")
+        bad = [
+            http("PUT", f"{MASTER}/views/999.0.0.0/8", {"records": []}),
+            http("PUT", f"{MASTER}/views/2001:db8::/32", {"records": []}),
+            http("PUT", f"{MASTER}/views/127.0.0.0/8/records/evil.other.test",
+                 {"ip": "10.0.0.9"}),
+            http("PUT", f"{MASTER}/views/127.0.0.0/8/records/bad.lab.test",
+                 {"ip": "999.1.1.1"}),
+            http("PUT", f"{MASTER}/views/127.0.0.0/8", {"records": [
+                {"name": "dup.lab.test", "ip": "10.0.0.9"},
+                {"name": "dup.lab.test", "ip": "10.0.0.10"},
+            ]}),
+        ]
+        check("invalid view publishes all rejected (400)",
+              all(s == 400 for s, _ in bad), json.dumps([s for s, _ in bad]))
+        st, after = http("GET", f"{MASTER}/zone/serial")
+        check("failed publishes did not bump the serial",
+              after.get("serial") == before.get("serial"), f"before={before} after={after}")
+        r = dns_query("viewonly.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
+        check("slave still serves last good view after failed publishes",
+              any(a["value"] == "192.168.8.9" for a in r["answers"]), json.dumps(r))
+        master.stop()
+        st, body = http("POST", f"{SLAVE}/sync", {})
+        check("sync with master down -> 502", st == 502, f"got {st} {body}")
+        r = dns_query("viewonly.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
+        check("view answer persists during master outage",
+              any(a["value"] == "192.168.8.9" for a in r["answers"]), json.dumps(r))
+        slave.stop()
+        time.sleep(0.5)
+        slave.start()
+        assert wait_http(f"{SLAVE}/status", slave), "slave did not restart"
+        st, body = http("GET", f"{SLAVE}/status")
+        check("after restart: view rules restored from SQLite",
+              st == 200 and body.get("serving") is True and body.get("views") == 1,
+              json.dumps(body))
+        r = dns_query("viewonly.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
+        check("after restart: view answer without any sync",
+              any(a["value"] == "192.168.8.9" for a in r["answers"]), json.dumps(r))
+        r = dns_query("back.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
+        check("after restart: public fallback intact",
+              any(a["value"] == "10.7.7.7" for a in r["answers"]), json.dumps(r))
+        master.start()
+        assert wait_http(f"{MASTER}/zone/serial", master), "master did not restart"
 
     finally:
         slave.stop()

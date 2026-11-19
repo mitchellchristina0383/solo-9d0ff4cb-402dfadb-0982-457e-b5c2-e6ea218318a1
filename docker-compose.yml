@@ -8,6 +8,8 @@ services:
       - master-data:/data
     ports:
       - "8000:8000"   # HTTP API + /docs
+    networks:
+      - dnsnet
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/zone/serial', timeout=3)"]
       interval: 5s
@@ -28,9 +30,22 @@ services:
     ports:
       - "8001:8000"        # HTTP API + /docs
       - "5353:5353/udp"    # DNS
+    networks:
+      - dnsnet
     depends_on:
       master:
         condition: service_healthy
+
+networks:
+  dnsnet:
+    driver: bridge
+    ipam:
+      config:
+        # Pinned so the view demo in README.md is reproducible: DNS queries
+        # sent from the host to the published UDP port arrive at the slave
+        # from this network's gateway (172.30.99.1). If this subnet collides
+        # with one on your machine, pick another and adjust the view CIDR.
+        - subnet: 172.30.99.0/24
 
 volumes:
   master-data:

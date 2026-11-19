@@ -3,12 +3,16 @@
 Supports exactly what the lab.test master/slave setup needs:
 - parsing standard queries (one question, compression-pointer tolerant)
 - building A / SOA answers, NXDOMAIN / NODATA / SERVFAIL / REFUSED / FORMERR
+- per-source-network views: longest-prefix match on the client IPv4 address
+  selects at most one view; only names explicitly overridden in that view
+  differ from the public records.
 
 No dependencies outside the standard library.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import struct
 from typing import Optional
 
@@ -156,13 +160,46 @@ def formerr(data: bytes) -> Optional[bytes]:
     return struct.pack("!HHHHHH", xid, rflags, 0, 0, 0, 0)
 
 
-def answer(query: Query, zone, apex: str) -> bytes:
+def select_record(zone, name: str, client_ip: Optional[str]):
+    """Pick the A record for `name` as seen from `client_ip`.
+
+    View semantics (views are per-source-network override lists):
+    - the client's IPv4 address selects AT MOST one view: the matching
+      network with the longest prefix (zone.views is sorted longest-first);
+    - if the selected view overrides `name`, the view's (ip, ttl) wins;
+    - names not overridden by the selected view, and clients matching no
+      view at all, fall back to the public record set;
+    - a view is never consulted for a client outside its network, so a
+      revoked override can only fall back to the public address, never to
+      another view's address.
+
+    Returns (ip, ttl) or None. `zone.views` is an optional tuple of
+    (IPv4Network, {fqdn: (ip, ttl)}) sorted by prefix length, longest first.
+    """
+    rec = zone.records.get(name)
+    views = getattr(zone, "views", None)
+    if not views or client_ip is None:
+        return rec
+    try:
+        ip = ipaddress.IPv4Address(client_ip)
+    except ValueError:
+        return rec  # non-IPv4 peer: public view
+    for net, view_records in views:
+        if ip in net:
+            # Longest-prefix match found: this view alone decides; names it
+            # does not override fall back to the public record.
+            return view_records.get(name, rec)
+    return rec
+
+
+def answer(query: Query, zone, apex: str, client_ip: Optional[str] = None) -> bytes:
     """Build an authoritative answer for `query` from `zone`.
 
     `zone` is either None (no version loaded yet -> SERVFAIL) or an object
-    with attributes: serial (int), soa (dict), records ({fqdn: (ip, ttl)}).
-    Every response is built from exactly one zone object, so the records and
-    the SOA in a single answer always belong to the same version.
+    with attributes: serial (int), soa (dict), records ({fqdn: (ip, ttl)}),
+    and optionally views (see select_record). Every response is built from
+    exactly one zone object, so the records, the view rules and the SOA in a
+    single answer always belong to the same version.
     """
     if query.qclass != QCLASS_IN:
         return build_response(query, RCODE_REFUSED, aa=False)
@@ -173,7 +210,7 @@ def answer(query: Query, zone, apex: str) -> bytes:
         # Never synced: must report unavailable rather than guess.
         return build_response(query, RCODE_SERVFAIL, aa=False)
 
-    rec = zone.records.get(name)
+    rec = select_record(zone, name, client_ip)
     is_apex = name == apex
     exists = is_apex or rec is not None
     if not exists:

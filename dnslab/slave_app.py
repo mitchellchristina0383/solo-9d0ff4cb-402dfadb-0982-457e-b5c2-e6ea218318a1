@@ -5,13 +5,18 @@ Pulls full zone snapshots from the master over HTTP and serves DNS over UDP.
 Guarantees:
 - atomic version switch: a snapshot is verified (shape + SHA-256), written to
   SQLite in a single transaction, and only then swapped into memory — clients
-  never see a mix of old and new records, and every answer's records and SOA
-  come from the same version;
+  never see a mix of old and new records, and every answer's records, view
+  rules and SOA come from the same version;
+- per-source-network views: the client IPv4 address selects at most one view
+  (longest-prefix match); only names overridden in that view differ from the
+  public records; unmatched networks and uncovered names use public records;
 - no rollback: a snapshot whose serial is not greater than the active one is
   rejected, so a late old version can never overwrite a newer one;
 - survives master outages and own restarts: the last good version is kept in
   SQLite and reloaded on boot; if no version was ever synced, the node answers
-  SERVFAIL (unavailable) instead of guessing.
+  SERVFAIL (unavailable) instead of guessing;
+- both snapshot formats are accepted: current (with view rules) and legacy
+  v1 (no "views" key — treated as an empty view set).
 """
 
 from __future__ import annotations
@@ -47,12 +52,14 @@ SOA_TIMERS = {"refresh": 7200, "retry": 3600, "expire": 1209600, "minimum": 300}
 class ZoneData:
     """One immutable, internally consistent zone version."""
 
-    __slots__ = ("serial", "soa", "records")
+    __slots__ = ("serial", "soa", "records", "views")
 
-    def __init__(self, serial: int, soa: dict, records: dict):
+    def __init__(self, serial: int, soa: dict, records: dict, views: tuple = ()):
         self.serial = serial
         self.soa = soa
-        self.records = records  # {fqdn: (ip, ttl)}
+        self.records = records  # {fqdn: (ip, ttl)} — public view
+        # ((IPv4Network, {fqdn: (ip, ttl)}), ...) sorted longest-prefix-first
+        self.views = views
 
 
 class SlaveState:
@@ -101,6 +108,13 @@ def init_db() -> None:
                 ip   TEXT NOT NULL,
                 ttl  INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS view_records(
+                cidr TEXT NOT NULL,
+                name TEXT NOT NULL,
+                ip   TEXT NOT NULL,
+                ttl  INTEGER NOT NULL,
+                PRIMARY KEY (cidr, name)
+            );
             """
         )
         conn.commit()
@@ -123,7 +137,15 @@ def load_persisted() -> Optional[ZoneData]:
 
 def _zone_from_snapshot(snap: dict) -> ZoneData:
     records = {r["name"]: (r["ip"], int(r["ttl"])) for r in snap["records"]}
-    return ZoneData(snap["serial"], dict(snap["soa"]), records)
+    views = []
+    for v in snap.get("views", []):  # legacy v1 snapshots have no views key
+        # strict=False matches verify_snapshot: host bits are normalized away.
+        net = ipaddress.IPv4Network(v["cidr"], strict=False)
+        vrecs = {r["name"]: (r["ip"], int(r["ttl"])) for r in v["records"]}
+        views.append((net, vrecs))
+    # Longest prefix first: the first matching network wins at answer time.
+    views.sort(key=lambda item: item[0].prefixlen, reverse=True)
+    return ZoneData(snap["serial"], dict(snap["soa"]), records, tuple(views))
 
 
 # --------------------------------------------------------------------------
@@ -141,6 +163,11 @@ def verify_snapshot(snap: dict) -> None:
     if not isinstance(snap["serial"], int) or snap["serial"] < 1:
         raise ValueError("bad serial")
     payload = {k: snap[k] for k in ("zone", "serial", "soa", "records")}
+    if "views" in snap:
+        # v2 format: view rules are part of the checksummed payload. A
+        # legacy v1 snapshot has no views key and verifies with the
+        # original v1 digest formula.
+        payload["views"] = snap["views"]
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     if digest != snap["sha256"]:
         raise ValueError("sha256 mismatch")
@@ -150,13 +177,36 @@ def verify_snapshot(snap: dict) -> None:
     if not isinstance(snap["records"], list):
         raise ValueError("records is not a list")
     for r in snap["records"]:
-        name = str(r["name"]).rstrip(".").lower()
-        if name != ZONE and not name.endswith("." + ZONE):
-            raise ValueError(f"record {name!r} outside zone")
-        ipaddress.IPv4Address(r["ip"])  # raises on junk
-        ttl = int(r["ttl"])
-        if not (0 <= ttl <= 2**31 - 1):
-            raise ValueError(f"bad ttl {ttl}")
+        _verify_record(r)
+    if "views" in snap:
+        if not isinstance(snap["views"], list):
+            raise ValueError("views is not a list")
+        seen_cidrs: set[str] = set()
+        for v in snap["views"]:
+            if not isinstance(v, dict) or "cidr" not in v or "records" not in v:
+                raise ValueError("malformed view entry")
+            try:
+                net = ipaddress.IPv4Network(str(v["cidr"]), strict=False)
+            except ValueError:
+                raise ValueError(f"bad view cidr {v['cidr']!r}")
+            key = str(net)
+            if key in seen_cidrs:
+                raise ValueError(f"duplicate view {key!r}")
+            seen_cidrs.add(key)
+            if not isinstance(v["records"], list):
+                raise ValueError("view records is not a list")
+            for r in v["records"]:
+                _verify_record(r)
+
+
+def _verify_record(r: dict) -> None:
+    name = str(r["name"]).rstrip(".").lower()
+    if name != ZONE and not name.endswith("." + ZONE):
+        raise ValueError(f"record {name!r} outside zone")
+    ipaddress.IPv4Address(r["ip"])  # raises on junk
+    ttl = int(r["ttl"])
+    if not (0 <= ttl <= 2**31 - 1):
+        raise ValueError(f"bad ttl {ttl}")
 
 
 def apply_snapshot(snap: dict) -> tuple[bool, str]:
@@ -182,6 +232,15 @@ def apply_snapshot(snap: dict) -> tuple[bool, str]:
                 "INSERT INTO records(name, ip, ttl) VALUES (?, ?, ?)",
                 [(n, ip, ttl) for n, (ip, ttl) in sorted(zone.records.items())],
             )
+            conn.execute("DELETE FROM view_records")
+            conn.executemany(
+                "INSERT INTO view_records(cidr, name, ip, ttl) VALUES (?, ?, ?, ?)",
+                [
+                    (str(net), n, ip, ttl)
+                    for net, vrecs in zone.views
+                    for n, (ip, ttl) in sorted(vrecs.items())
+                ],
+            )
             conn.execute(
                 "INSERT INTO meta(key, value) VALUES('serial', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -194,7 +253,10 @@ def apply_snapshot(snap: dict) -> tuple[bool, str]:
             )
             conn.commit()
         state.zone = zone  # atomic swap, after durable commit
-    return True, f"applied serial {new_serial} ({len(zone.records)} records)"
+    return True, (
+        f"applied serial {new_serial} "
+        f"({len(zone.records)} records, {len(zone.views)} views)"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -255,13 +317,13 @@ async def _poll_loop() -> None:
 # DNS over UDP
 # --------------------------------------------------------------------------
 
-def handle_query(data: bytes) -> Optional[bytes]:
+def handle_query(data: bytes, client_ip: Optional[str] = None) -> Optional[bytes]:
     try:
         query = dnsproto.Query(data)
     except dnsproto.DnsError:
         return dnsproto.formerr(data)
     zone = state.zone  # one atomic read -> whole answer from one version
-    return dnsproto.answer(query, zone, ZONE)
+    return dnsproto.answer(query, zone, ZONE, client_ip=client_ip)
 
 
 class DnsProtocol(asyncio.DatagramProtocol):
@@ -269,7 +331,7 @@ class DnsProtocol(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data, addr):
-        response = handle_query(data)
+        response = handle_query(data, client_ip=addr[0])
         if response is not None:
             self.transport.sendto(response, addr)
 
@@ -303,8 +365,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="lab.test DNS slave",
     description="Pulls snapshots from the master and answers A/SOA/NXDOMAIN "
-    "over UDP. Only complete, newer versions are applied.",
-    version="1.0.0",
+    "over UDP, with per-source-network views (longest-prefix match). Only "
+    "complete, newer versions are applied.",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -322,6 +385,7 @@ def status() -> dict:
         "serving": zone is not None,
         "serial": zone.serial if zone else None,
         "records": len(zone.records) if zone else 0,
+        "views": len(zone.views) if zone else 0,
         "zone": ZONE,
         "master_url": MASTER_URL,
         "dns_port": DNS_PORT,
@@ -344,6 +408,16 @@ def zone_dump() -> dict:
         "records": [
             {"name": n, "ip": ip, "ttl": ttl}
             for n, (ip, ttl) in sorted(zone.records.items())
+        ],
+        "views": [
+            {
+                "cidr": str(net),
+                "records": [
+                    {"name": n, "ip": ip, "ttl": ttl}
+                    for n, (ip, ttl) in sorted(vrecs.items())
+                ],
+            }
+            for net, vrecs in zone.views
         ],
     }
 
